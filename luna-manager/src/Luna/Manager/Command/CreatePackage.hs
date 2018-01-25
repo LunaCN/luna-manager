@@ -378,7 +378,7 @@ updateConfig config resolvedApplication =
         appDesc    = app ^. desc
         appHeader  = app ^. header
         appName    = appHeader ^. name
-        mainPackagePath = "https://d1uis3r8vv41jj.cloudfront.net/"
+        mainPackagePath = "http://d1uis3r8vv41jj.cloudfront.net/"
         applicationPartPackagePath = appName <> "/" <> showPretty (view version appHeader) <> "/" <> appName
         s3Path = case currentHost of
             Darwin  -> mainPackagePath <> "darwin/"  <> applicationPartPackagePath <> ".tar.gz"
