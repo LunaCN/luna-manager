@@ -3,6 +3,8 @@ module Luna.Manager.System.Path where
 import Prologue hiding (FilePath, null, fromText)
 
 import Luna.Manager.System.Env
+import qualified Luna.Manager.Logger as Logger
+import           Luna.Manager.Logger (LoggerMonad)
 
 import qualified Filesystem.Path as Path
 import Filesystem.Path (FilePath, null)
@@ -14,7 +16,7 @@ type URIPath  = Text
 instance Convertible Text FilePath where
     convert = fromText
 
-expand :: MonadIO m => FilePath -> m FilePath
+expand :: (LoggerMonad m, MonadIO m) => FilePath -> m FilePath
 expand path = if null path
     then return path
     else do

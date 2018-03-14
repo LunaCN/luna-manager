@@ -35,23 +35,26 @@ instance MonadShControl m => MonadShControl (StateT s m) where
             h' s = fmap StateTShM $ h (unwrap s)
 
 
-mv :: (MonadIO m, MonadSh m, MonadCatch m) => FilePath -> FilePath -> m ()
+mv :: (Logger.LoggerMonad m, MonadIO m, MonadSh m, MonadCatch m) => FilePath -> FilePath -> m ()
 mv src dst = case currentHost of
     Linux   -> cmd "mv" src dst
     Darwin  -> cmd "mv" src dst
-    Windows -> Sh.mv src dst 
+    Windows -> do
+        Logger.log "Shelly.mv"
+        Logger.logObject "src" src
+        Logger.logObject "dst" dst
+        Sh.mv src dst
 
 
-rm_rf :: (MonadIO m, MonadSh m, MonadCatch m) => FilePath -> m ()
+rm_rf :: (Logger.LoggerMonad m, MonadIO m, MonadSh m, MonadCatch m) => FilePath -> m ()
 rm_rf path = case currentHost of
     Linux -> Sh.rm_rf path
     Darwin -> Sh.rm_rf path
-    Windows -> do 
-        isDirectory <- Sh.test_d path
+    Windows -> do
         Prologue.whenM (Sh.test_d path) $ do
-            list <- Sh.ls path 
+            list <- Sh.ls path
             mapM_ rm_rf list
-        Sh.rm_rf path
+        Prologue.whenM (Sh.test_e path) $ liftIO $ Process.runProcess_ $ Process.shell $ "powershell Remove-Item -Recurse -Force -Path " <> encodeString path
 
 switchVerbosity :: Logger.LoggerMonad m => m a -> m a
 switchVerbosity act = do

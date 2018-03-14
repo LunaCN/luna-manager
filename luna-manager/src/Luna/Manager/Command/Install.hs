@@ -1,53 +1,55 @@
 {-# LANGUAGE ExtendedDefaultRules #-}
 {-# LANGUAGE OverloadedStrings    #-}
+
 module Luna.Manager.Command.Install where
 
-import Prologue hiding (txt, FilePath, toText)
+import Prologue hiding (txt, FilePath, toText, (<.>))
 
-import Luna.Manager.System.Host
-import Luna.Manager.System.Env
-import Luna.Manager.Component.Repository as Repo
-import Luna.Manager.Component.Version    as Version
-import Luna.Manager.Component.Analytics  as Analytics
-import Luna.Manager.Network
-import Luna.Manager.Component.Pretty
-import Luna.Manager.Shell.Question
-import           Luna.Manager.Command.Options (Options, InstallOpts)
-import qualified Luna.Manager.Command.Options as Opts
-import Luna.Manager.System.Path
-import Luna.Manager.System (makeExecutable, exportPathUnix, exportPathWindows, checkShell, runServicesWindows, stopServicesWindows, exportPathWindows)
+import           Luna.Manager.Archive              as Archive
+import qualified Luna.Manager.Command.Options      as Opts
+import           Luna.Manager.Command.Options      (Options, InstallOpts)
+import           Luna.Manager.Component.Analytics  as Analytics
+import           Luna.Manager.Component.Pretty
+import           Luna.Manager.Component.Repository as Repo
+import           Luna.Manager.Component.Version    as Version
+import           Luna.Manager.Gui.DownloadProgress
+import qualified Luna.Manager.Gui.Initialize       as Initilize
+import           Luna.Manager.Gui.InstallationProgress
+import qualified Luna.Manager.Logger               as Logger
+import           Luna.Manager.Network
+import           Luna.Manager.Shell.Question
+import qualified Luna.Manager.Shell.Shelly         as Shelly
+import           Luna.Manager.Shell.Shelly         (toTextIgnore, MonadSh, MonadShControl)
+import           Luna.Manager.System               (makeExecutable, exportPath, askToExportPath, checkShell, runServicesWindows, stopServicesWindows, checkChecksum, shaUriError)
+import           Luna.Manager.System.Env
+import           Luna.Manager.System.Host
+import           Luna.Manager.System.Path
 
-import Control.Lens.Aeson
-import Control.Monad.Raise
-import Control.Monad.State.Layered
-import Control.Monad.Trans.Resource (MonadBaseControl)
-
-import qualified Data.Char as Char
-import Data.Maybe (listToMaybe)
-import qualified Data.Map as Map
-import qualified Data.Text as Text
-import qualified Data.Text.IO as Text
-
-import qualified Data.Yaml as Yaml
-
-import Filesystem.Path.CurrentOS (FilePath, (</>), encodeString, decodeString, toText, basename, hasExtension, parent)
-import Luna.Manager.Shell.Shelly (toTextIgnore, MonadSh, MonadShControl)
-import qualified Luna.Manager.Shell.Shelly as Shelly
-import System.Exit (exitSuccess, exitFailure)
-import System.IO (hFlush, stdout, stderr, hPutStrLn)
-import System.Info (arch)
-import qualified System.Process.Typed as Process
-import qualified System.Directory as System
-import qualified System.Environment as Environment
-import Luna.Manager.Archive as Archive
-import qualified Luna.Manager.Gui.Initialize as Initilize
-import qualified Data.Aeson          as JSON
-import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy as BSL
-import qualified Control.Exception.Safe as Exception
-
-import Luna.Manager.Gui.InstallationProgress
-import Data.Aeson (ToJSON, toJSON, toEncoding, encode)
+import           Control.Concurrent                (forkIO)
+import qualified Control.Exception.Safe            as Exception
+import           Control.Lens.Aeson
+import           Control.Monad.Raise
+import           Control.Monad.State.Layered
+import           Control.Monad.Trans.Resource      (MonadBaseControl)
+import qualified Crypto.Hash                       as Crypto
+import qualified Data.Aeson                        as JSON
+import           Data.Aeson                        (ToJSON, toJSON, toEncoding, encode)
+import qualified Data.ByteString                   as BS
+import qualified Data.ByteString.Lazy              as BSL
+import qualified Data.Char                         as Char
+import qualified Data.Map                          as Map
+import           Data.Maybe                        (listToMaybe)
+import qualified Data.Text                         as Text
+import qualified Data.Text.IO                      as Text
+import qualified Data.Yaml                         as Yaml
+import           Filesystem.Path.CurrentOS         (FilePath, (</>), (<.>), encodeString, decodeString, toText, basename, hasExtension, parent, dropExtension)
+import qualified Network.URI                       as URI
+import qualified System.Directory                  as System
+import qualified System.Environment                as Environment
+import qualified System.Process.Typed              as Process
+import           System.Exit                       (exitSuccess, exitFailure, ExitCode(..))
+import           System.Info                       (arch)
+import           System.IO                         (hFlush, stdout, stderr, hPutStrLn)
 
 default(Text.Text)
 
@@ -109,7 +111,7 @@ instance Monad m => MonadHostConfig InstallConfig 'Darwin arch m where
 
 instance Monad m => MonadHostConfig InstallConfig 'Windows arch m where
     defaultHostConfig = reconfig <$> defaultHostConfigFor @Linux where
-        reconfig cfg = cfg & defaultBinPathGuiApp   .~ "C:\\Program Files"
+        reconfig cfg = cfg & defaultBinPathGuiApp .~ "C:\\Program Files"
 
 
 
@@ -125,8 +127,7 @@ makeLenses ''UnresolvedDepsError
 instance Exception UnresolvedDepsError where
     displayException err = "Following dependencies were unable to be resolved: " <> show (showPretty <$> unwrap err)
 
-type MonadInstall m = (MonadGetter Options m, MonadStates '[EnvConfig, InstallConfig, RepoConfig, MPUserData] m, MonadNetwork m, Shelly.MonadSh m, Shelly.MonadShControl m)
-
+type MonadInstall m = (MonadGetter Options m, MonadStates '[EnvConfig, InstallConfig, RepoConfig, MPUserData] m, MonadNetwork m, Shelly.MonadSh m, Shelly.MonadShControl m, Logger.LoggerMonad m)
 
 -- === Utils === --
 
@@ -148,7 +149,7 @@ prepareInstallPath :: MonadInstall m => AppType -> FilePath -> Text -> Text -> m
 prepareInstallPath appType appPath appName appVersion = expand $ case currentHost of
     Linux   -> appPath </> convert appName </> convert appVersion
     Windows -> case appType of
-        GuiApp -> appPath </> convert (mkSystemPkgName appName) </> convert appVersion
+        GuiApp   -> appPath </> convert (mkSystemPkgName appName) </> convert appVersion
         BatchApp -> appPath </> convert appName </> convert appVersion
     Darwin  -> case appType of
         GuiApp   -> appPath </> convert ((mkSystemPkgName appName) <> ".app") </> "Contents" </> "Resources" </> convert appVersion
@@ -174,21 +175,41 @@ checkIfAppAlreadyInstalledInCurrentVersion installPath appType pkgVersion = do
             then liftIO $ exitSuccess
             else checkIfAppAlreadyInstalledInCurrentVersion installPath appType pkgVersion
 
+data ResolvePackagePathException = ResolvePackagePathException Text deriving (Show)
+instance Exception ResolvePackagePathException where
+    displayException (ResolvePackagePathException file) = "Couldn't download file: " <> convert file <> " invalid URI address"
+
+downloadIfUri :: MonadInstall m => URIPath -> m FilePath
+downloadIfUri path = do
+    doesFileExist <- Shelly.test_f $ fromText path
+    if doesFileExist then return $ fromText path
+        else if URI.isURI $ convert path
+            then downloadWithProgressBar path
+            else throwM $ ResolvePackagePathException path
+
 downloadAndUnpackApp :: MonadInstall m => URIPath -> FilePath -> Text -> AppType -> Version -> m ()
 downloadAndUnpackApp pkgPath installPath appName appType pkgVersion = do
+    guiInstaller <- Opts.guiInstallerOpt
     checkIfAppAlreadyInstalledInCurrentVersion installPath appType pkgVersion
     stopServices installPath appType
+    when guiInstaller $ downloadProgress (Progress 0 1)
     Shelly.mkdir_p $ parent installPath
-    pkg      <- downloadWithProgressBar pkgPath
-    unpacked <- Archive.unpack 0.9 "installation_progress" pkg
+    pkgPathNoExtension <- tryJust (shaUriError pkgPath) $ case currentHost of
+            Linux -> Text.stripSuffix "AppImage" pkgPath
+            _     -> Text.stripSuffix "tar.gz" pkgPath
+    let pkgShaPath = pkgPathNoExtension <> "sha256"
+    pkg    <- downloadIfUri pkgPath
+    pkgSha <- downloadIfUri pkgShaPath
+
+    when guiInstaller $ installationProgress 0
+    checkChecksum @Crypto.SHA256 pkg pkgSha
+    unpacked <- Archive.unpack (if currentHost==Windows then 0.5 else 0.9) "installation_progress" pkg
+    Logger.info $ "Copying files from " <> toTextIgnore unpacked <> " to " <> toTextIgnore installPath
     case currentHost of
          Linux   -> do
              Shelly.mkdir_p installPath
              Shelly.mv unpacked $ installPath </> convert appName
          _  -> Shelly.mv unpacked  installPath
-    -- Shelly.rm_rf tmp -- FIXME[WD -> SB]: I commented it out, we use downloadWithProgressBar now which automatically downloads to tmp.
-                        --                  However, manuall tmp removing is error prone! Create a wrapper like `withTmp $ \tmp -> downloadWithProgressBarTo pkgPath tmp; ...`
-                        --                  which automatically removes tmp on the end!
 
 linkingCurrent :: MonadInstall m => AppType -> FilePath -> m ()
 linkingCurrent appType installPath = do
@@ -198,11 +219,13 @@ linkingCurrent appType installPath = do
 
 makeShortcuts :: MonadInstall m => FilePath -> Text -> m ()
 makeShortcuts packageBinPath appName = when (currentHost == Windows) $ do
+    Logger.info "Creating Menu Start shortcut."
     bin         <- liftIO $ System.getSymbolicLinkTarget $ encodeString packageBinPath
     binAbsPath  <- Shelly.canonicalize $ (parent packageBinPath) </> (decodeString bin)
-    userProfile <- liftIO $ Environment.getEnv "userprofile"
-    let menuPrograms = (decodeString userProfile) </> "AppData" </> "Roaming" </> "Microsoft" </> "Windows" </> "Start Menu" </> "Programs" </> convert ((mkSystemPkgName appName) <> ".lnk")
-    liftIO $ Process.runProcess_ $ Process.shell ("powershell" <> " \"$s=New-Object -ComObject WScript.Shell; $sc=$s.createShortcut(" <> "\'" <> (encodeString menuPrograms) <> "\'" <> ");$sc.TargetPath=" <> "\'" <> (encodeString binAbsPath) <> "\'" <> ";$sc.Save()\"" )
+    appData     <- liftIO $ Environment.getEnv "appdata"
+    let menuPrograms = (decodeString appData) </> "Microsoft" </> "Windows" </> "Start Menu" </> "Programs" </> convert ((mkSystemPkgName appName) <> ".lnk")
+    exitCode <- liftIO $ Process.runProcess $ Process.shell  ("powershell" <> " \"$s=New-Object -ComObject WScript.Shell; $sc=$s.createShortcut(" <> "\'" <> (encodeString menuPrograms) <> "\'" <> ");$sc.TargetPath=" <> "\'" <> (encodeString binAbsPath) <> "\'" <> ";$sc.Save()\"")
+    unless (exitCode == ExitSuccess) $ Logger.warning $ "Menu Start shortcut was not created. Powershell could not be found in the $PATH"
 
 postInstallation :: MonadInstall m => AppType -> FilePath -> Text -> Text -> Text -> m ()
 postInstallation appType installPath binPath appName version = do
@@ -253,12 +276,14 @@ linkingLocalBin :: (MonadInstall m, MonadIO m) => FilePath -> Text -> m ()
 linkingLocalBin currentBin appName = do
     home          <- getHomePath
     installConfig <- get @InstallConfig
+    gui           <- Opts.guiInstallerOpt
     case currentHost of
-        Windows -> exportPathWindows currentBin
+        Windows -> do
+            if gui then exportPath currentBin else askToExportPath currentBin
         _       -> do
             localBin <- expand (installConfig ^. localBinPath)
             linking currentBin $ localBin </> convert appName
-            exportPathUnix localBin
+            if gui then exportPath localBin else askToExportPath localBin
 
 -- === Windows specific === --
 
@@ -269,8 +294,6 @@ stopServices installPath appType = when (currentHost == Windows && appType == Gu
     do
         testservices <- Shelly.test_d currentServices
         when testservices $ stopServicesWindows currentServices
-
-
 
 runServices :: MonadInstall m => FilePath -> AppType -> Text -> Text -> m ()
 runServices installPath appType appName version = when (currentHost == Windows && appType == GuiApp) $ do
@@ -295,29 +318,61 @@ copyWinSW installPath = when (currentHost == Windows) $ do
         winConfigFolderPath = installPath </> (installConfig ^. configPath) </> fromText "windows"
     Shelly.mv winSW winConfigFolderPath
 
+registerUninstallInfo :: MonadInstall m => FilePath -> m ()
+registerUninstallInfo installPath = when (currentHost == Windows) $ do
+    installConfig <- get @InstallConfig
+    let registerScript = installPath </> (installConfig ^. configPath) </> fromText "windows" </> "registerUninstall.ps1"
+        directory      = parent $ parent installPath -- if default, c:\Program Files\
+    pkgHasRegister <- Shelly.test_f registerScript
+    when pkgHasRegister $ do
+        let registerPowershell = "powershell -executionpolicy bypass -file \"" <> toTextIgnore registerScript <> "\" \"" <> toTextIgnore directory <> "\""
+        Logger.logProcess registerPowershell
+
+moveUninstallScript :: MonadInstall m => FilePath -> m ()
+moveUninstallScript installPath = when (currentHost == Windows) $ do
+    installConfig <- get @InstallConfig
+    let uninstallScript = installPath </> (installConfig ^. configPath) </> fromText "windows" </> "uninstallLunaStudio.ps1"
+        rootInstallPath = parent installPath
+    pkgHasUninstall <- Shelly.test_f uninstallScript
+    when pkgHasUninstall $
+        Shelly.cp uninstallScript $ rootInstallPath </> "uninstallLunaStudio.ps1"
+
 prepareWindowsPkgForRunning :: MonadInstall m => FilePath -> m ()
 prepareWindowsPkgForRunning installPath = do
+    installConfig <- get @InstallConfig
+    guiInstaller  <- Opts.guiInstallerOpt
+    when guiInstaller $ installationProgress 0.7
     copyDllFilesOnWindows installPath
+    when guiInstaller $ installationProgress 0.75
     copyWinSW installPath
+    when guiInstaller $ installationProgress 0.8
+    registerUninstallInfo installPath
+    when guiInstaller $ installationProgress 0.85
+    moveUninstallScript installPath
 
 copyUserConfig :: MonadInstall m => FilePath -> ResolvedPackage -> m ()
 copyUserConfig installPath package = do
+    unless (currentHost == Linux) $ Logger.info "Copying user config to ~/.luna"
     installConfig <- get @InstallConfig
     let pkgName               = package ^. header . name
         pkgVersion            = showPretty $ package ^. header . version
         packageUserConfigPath = installPath </> "user-config"
-    homeUserConfigPath <- expand $ (installConfig ^. defaultConfPath) </> (installConfig ^. configPath) </> convert pkgName </> convert pkgVersion
+    homeLunaPath      <- expand $ installConfig ^. defaultConfPath
+    let homeUserConfigPath = homeLunaPath </> (installConfig ^. configPath) </> convert pkgName </> convert pkgVersion
     userConfigExists   <- Shelly.test_d packageUserConfigPath
     when userConfigExists $ do
         Shelly.rm_rf homeUserConfigPath
         Shelly.mkdir_p homeUserConfigPath
         listedPackageUserConfig <- Shelly.ls packageUserConfigPath
         mapM_ (flip Shelly.cp_r homeUserConfigPath) $ map (packageUserConfigPath </>) listedPackageUserConfig
+    when (currentHost == Windows) $ do
+        exitCode <- liftIO $ Process.runProcess $ Process.shell $ "attrib +h " <> encodeString homeLunaPath
+        unless (exitCode == ExitSuccess) $ Logger.warning $ "Setting hidden attribute for .luna folder failed"
 
 -- === MacOS specific === --
 
 touchApp :: MonadInstall m => FilePath -> AppType -> m ()
-touchApp appPath appType = when (currentHost == Darwin && appType == GuiApp) $
+touchApp appPath appType = when (currentHost == Darwin && appType == GuiApp) $ do
         Shelly.switchVerbosity $ Shelly.cmd "touch" $ toTextIgnore appPath
 
 -- === Installation utils === --
@@ -330,7 +385,7 @@ askLocation opts appType appName = do
             BatchApp -> installConfig ^. defaultBinPathBatchApp
     binPath <- askOrUse (opts ^. Opts.selectedInstallationPath)
         $ question ("Select installation path for " <> appName) plainTextReader
-        & defArg .~ Just (toTextIgnore pkgInstallDefPath) --TODO uzyć toText i złapać tryRight'
+        & defArg .~ Just (toTextIgnore pkgInstallDefPath)
     return binPath
 
 installApp :: MonadInstall m => InstallOpts -> ResolvedPackage -> m ()
@@ -372,16 +427,42 @@ readVersion v = case readPretty v of
 askUserEmail :: MonadIO m => m Text
 askUserEmail = liftIO $ do
     putStrLn $  "Please enter your email address (it is optional"
-             <> " but will help us greatly in the early alpha stage):"
+             <> " but will help us greatly in the early beta stage):"
     Text.getLine
+
+runApp :: MonadInstall m => Text -> Text -> AppType -> m ()
+runApp appName version appType = do
+    installConfig <- get @InstallConfig
+    installPath <- prepareInstallPath appType (installConfig ^. defaultBinPathGuiApp) appName version
+    let runPath = installPath </> (case currentHost of Linux -> ""; _ -> "bin" </> "main") </> fromText appName
+    threadID <- liftIO $ forkIO $ Process.runProcess_ $ Process.shell $ encodeString $ runPath
+    Logger.log $ Text.pack $ show threadID
+
+askToRunApp :: MonadInstall m => Text -> Text -> AppType -> m ()
+askToRunApp appName version appType = when (appType == GuiApp) $ do
+    guiInstaller <- Opts.guiInstallerOpt
+    if guiInstaller then do
+        Logger.log $ "ApplicationRun json" <> (Text.pack $ show $ encode $ ApplicationRun appName)
+        print $ encode $ ApplicationRun appName
+        liftIO $ hFlush stdout
+        doesRun <- liftIO $ BS.getLine
+        Logger.log $ "ApplicationRun answear " <> (Text.pack $ show doesRun)
+        let runOpt = JSON.decode $ BSL.fromStrict doesRun :: Maybe Run
+        when (isJust runOpt) $ Shelly.silently $ runApp appName version appType
+        print $ encode $ ApplicationClose True
+        else do
+            liftIO $ Text.putStrLn $  "Do you want to run " <> appName <> "? yes/no [yes]"
+            ans <- liftIO $ Text.getLine
+            when (ans == "yes" || ans == "") $ runApp appName version appType
+
 
 -- === Running === --
 
-run :: (MonadInstall m) => InstallOpts -> m ()
+run :: MonadInstall m => InstallOpts -> m ()
 run opts = do
     userInfoPath <- gets @InstallConfig userInfoFile
     guiInstaller <- Opts.guiInstallerOpt
-    repo         <- getRepo
+    repo <- maybe getRepo (parseConfig . convert) (opts ^. Opts.localConfig)
     if guiInstaller then do
         Initilize.generateInitialJSON repo =<< (Analytics.userInfoExists userInfoPath)
         liftIO $ hFlush stdout
@@ -389,20 +470,30 @@ run opts = do
 
         let install = JSON.decode $ BSL.fromStrict options :: Maybe Initilize.Option
         forM_ install $ \(Initilize.Option (Initilize.Install appName appVersion emailM)) -> do
+            Logger.logObject "[run] appName"    appName
+            Logger.logObject "[run] appVersion" appVersion
             Analytics.mpRegisterUser userInfoPath $ fromMaybe "" emailM
             Analytics.mpTrackEvent "LunaInstaller.Started"
-            appPkg           <- tryJust undefinedPackageError $ Map.lookup appName (repo ^. packages)
-            evaluatedVersion <- tryJust (toException $ VersionException $ convert $ show appVersion) $ Map.lookup appVersion $ appPkg ^. versions --tryJust missingPackageDescriptionError $ Map.lookup currentSysDesc $ snd $ Map.lookup appVersion $ appPkg ^. versions
-            appDesc          <- tryJust (toException $ MissingPackageDescriptionError appVersion) $ Map.lookup currentSysDesc evaluatedVersion
+            appPkg           <- Logger.tryJustWithLog "Install.run" undefinedPackageError $ Map.lookup appName (repo ^. packages)
+            Logger.logObject "[run] App package" appPkg
+            evaluatedVersion <- Logger.tryJustWithLog "Install.run" (toException $ VersionException $ convert $ show appVersion) $ Map.lookup appVersion $ appPkg ^. versions --tryJust missingPackageDescriptionError $ Map.lookup currentSysDesc $ snd $ Map.lookup appVersion $ appPkg ^. versions
+            Logger.logObject "[run] evaluated version" evaluatedVersion
+            appDesc          <- Logger.tryJustWithLog "Install.run" (toException $ MissingPackageDescriptionError appVersion) $ Map.lookup currentSysDesc evaluatedVersion
+            Logger.logObject "[run] app description" appDesc
             let (unresolvedLibs, pkgsToInstall) = Repo.resolve repo appDesc
-            when (not $ null unresolvedLibs) . raise' $ UnresolvedDepsError unresolvedLibs
+            when (not $ null unresolvedLibs) $ do
+                let e = UnresolvedDepsError unresolvedLibs
+                Logger.exception "Install.run" $ toException e
+                raise' e
             let appsToInstall = filter (( <$> (^. header . name)) (`elem` (repo ^.apps))) pkgsToInstall
                 resolvedApp   = ResolvedPackage (PackageHeader appName appVersion) appDesc (appPkg ^. appType)
                 allApps       = resolvedApp : appsToInstall
+            Logger.logObject "[run] allApps" allApps
 
             mapM_ (installApp opts) $ allApps
             print $ encode $ InstallationProgress 1
             liftIO $ hFlush stdout
+            askToRunApp appName (showPretty appVersion) (appPkg ^. appType)
             Analytics.mpTrackEvent "LunaInstaller.Finished"
 
         else do
@@ -437,3 +528,5 @@ run opts = do
                 resolvedApp = ResolvedPackage (PackageHeader appName version) appPkgDesc (appPkg ^. appType)
                 allApps = resolvedApp : appsToInstall
             mapM_ (installApp opts) $ allApps
+
+            askToRunApp appName appVersion (appPkg ^. appType)

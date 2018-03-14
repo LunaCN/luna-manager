@@ -1,20 +1,27 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
 
 module Luna.Manager.System where
 
-import           Prologue                     hiding (FilePath,null, filter, appendFile, readFile, toText, fromText)
+import           Prologue                     hiding (FilePath,null, filter, appendFile, readFile, toText, fromText, (<.>))
 
+import qualified Control.Exception.Safe       as Exception
 import           Control.Monad.Raise
 import           Control.Monad.State.Layered
 import           Control.Monad.Trans.Resource (MonadBaseControl)
 import           Data.ByteString.Lazy         (ByteString, null)
 import           Data.ByteString.Lazy.Char8   (filter, unpack)
+import qualified Crypto.Hash                  as Crypto
+import qualified Crypto.Hash.Conduit          as Crypto
+import qualified Data.ByteString              as ByteString
 import           Data.Maybe                   (listToMaybe)
 import           Data.List                    (isInfixOf)
 import           Data.List.Split              (splitOn)
 import           Data.Text.IO                 (appendFile, readFile)
 import qualified Data.Text                    as Text
-import           Filesystem.Path.CurrentOS    (FilePath, (</>), encodeString, toText, parent)
+import qualified Data.Text.Encoding           as Text
+import qualified Data.Text.IO                 as Text
+import           Filesystem.Path.CurrentOS    (FilePath, (</>), (<.>), encodeString, toText, parent, directory, dropExtension)
 import           System.Directory             (executable, setPermissions, getPermissions, doesDirectoryExist, doesPathExist, getHomeDirectory)
 import qualified System.Environment           as Environment
 import           System.Exit
@@ -29,6 +36,10 @@ import           Luna.Manager.Shell.Shelly    (MonadSh, MonadShControl)
 import           Luna.Manager.System.Env
 import           Luna.Manager.System.Host
 
+
+---------------------------
+-- === Paths exports === --
+---------------------------
 
 data Shell = Bash | Zsh | Unknown deriving (Show)
 
@@ -94,8 +105,19 @@ getShExportFile = do
     checkedFiles <- mapM runControlCheck files
     return $ listToMaybe $ catMaybes checkedFiles
 
+askToExportPath :: (MonadIO m, MonadBaseControl IO m, LoggerMonad m, MonadCatch m) => FilePath -> m()
+askToExportPath pathToExport = do
+    liftIO $ Text.putStrLn $ "Do you want to export " <> Shelly.toTextIgnore pathToExport <> "? [yes]/no"
+    toExport <- liftIO $ Text.getLine
+    when (toExport == "yes" || toExport == "" ) $ exportPath pathToExport
+
+exportPath :: (MonadIO m, MonadBaseControl IO m, LoggerMonad m, MonadCatch m) => FilePath -> m ()
+exportPath pathToExport = case currentHost of
+    Windows -> exportPathWindows pathToExport
+    _       -> exportPathUnix pathToExport
+
 --TODO extract common logic for all unix terminals
-exportPathUnix :: (MonadIO m, MonadBaseControl IO m, LoggerMonad m) => FilePath -> m ()
+exportPathUnix :: (MonadIO m, MonadBaseControl IO m, LoggerMonad m, MonadCatch m) => FilePath -> m ()
 exportPathUnix pathToExport = do
     pathIsDirectory    <- liftIO $ doesDirectoryExist $ encodeString pathToExport
     properPathToExport <- if pathIsDirectory then return pathToExport else do
@@ -109,18 +131,20 @@ exportPathUnix pathToExport = do
     case file of
         Just f  -> do
             let path = encodeString f
-            exportExists <- Text.isInfixOf exportToAppend <$> liftIO (readFile path)
-            unless exportExists $
-                (liftIO $ appendFile path exportToAppend) `Shelly.catchany` (const warn)
+            Exception.handleAny (const warn) $ do
+                exportExists <- Text.isInfixOf exportToAppend <$> liftIO (readFile path)
+                unless exportExists $
+                    (liftIO $ appendFile path exportToAppend)
         Nothing -> warn
 
 exportPathWindows :: (MonadIO m, MonadBaseControl IO m, LoggerMonad m) => FilePath -> m ()
 exportPathWindows path = do
+    Logger.log "System.exportPathWindows"
     (exitCode1, pathenv, err1) <- Process.readProcess $ "echo %PATH%"
     let pathToexport = Path.dropTrailingPathSeparator $ encodeString $ parent path
         systemPath   = unpack pathenv
     unless (isInfixOf pathToexport systemPath) $ do
-        (exitCode, out, err) <- Process.readProcess $ Process.shell $ "setx PATH \"%PATH%;" ++ pathToexport ++ "\""
+        (exitCode, out, err) <- Process.readProcess $ Process.shell $ "setx PATH \"%PATH%;" <> pathToexport <> "\""
         unless (exitCode == ExitSuccess) $ Logger.warning $ "Path was not exported."
 
 makeExecutable :: MonadIO m => FilePath -> m ()
@@ -128,16 +152,65 @@ makeExecutable file = unless (currentHost == Windows) $ liftIO $ do
         p <- getPermissions $ encodeString file
         setPermissions (encodeString file) (p {executable = True})
 
-runServicesWindows :: (MonadSh m, MonadIO m, MonadShControl m) => FilePath -> FilePath -> m ()
+
+------------------------------
+-- === Windows Services === --
+------------------------------
+
+
+runServicesWindows :: (LoggerMonad m, MonadSh m, MonadIO m, MonadShControl m) => FilePath -> FilePath -> m ()
 runServicesWindows path logsPath = Shelly.chdir path $ do
+    Logger.log "System.runServicesWindows"
+    Logger.log "Making the logs dir"
     Shelly.mkdir_p logsPath
     let installPath = path </> Shelly.fromText "installAll.bat"
     Shelly.setenv "LUNA_STUDIO_LOG_PATH" $ Shelly.toTextIgnore logsPath
     Shelly.silently $ Shelly.cmd installPath --TODO create proper error
 
-stopServicesWindows :: MonadIO m => FilePath -> m ()
-stopServicesWindows path = Shelly.shelly $ Shelly.chdir path $ do
+stopServicesWindows :: (LoggerMonad m, MonadCatch m, MonadIO m) => FilePath -> m ()
+stopServicesWindows path = Shelly.chdir path $ do
         let uninstallPath = path </> Shelly.fromText "uninstallAll.bat"
         Shelly.silently $ Shelly.cmd uninstallPath `catch` handler where
-            handler :: MonadSh m => SomeException -> m ()
-            handler ex = return () -- Shelly.liftSh $ print ex --TODO create proper error
+            handler :: (LoggerMonad m, MonadSh m) => SomeException -> m ()
+            handler ex = Logger.exception "System.stopServicesWindows" ex -- Shelly.liftSh $ print ex --TODO create proper error
+
+-----------------------
+-- === Checksums === --
+-----------------------
+
+-- === Errors === --
+
+data CouldNotGenerateSHAUriError = CouldNotGenerateSHAUriError {pkgPath :: Text} deriving (Show)
+instance Exception CouldNotGenerateSHAUriError where
+    displayException (CouldNotGenerateSHAUriError pkgPath) = "Generating SHA file URI error: could not generate SHA uri base on " <> Text.unpack pkgPath
+
+shaUriError :: Text -> SomeException
+shaUriError = toException . CouldNotGenerateSHAUriError
+
+data SHAChecksumDoesNotMatchError = SHAChecksumDoesNotMatchError FilePath Text Text  deriving (Show)
+instance Exception SHAChecksumDoesNotMatchError where
+    displayException (SHAChecksumDoesNotMatchError file checksum expectedChecksum) =
+        "File " <> show file <> " checksum does not match with the one provided with package." <> "\n" <>
+        "Expected checksum: " <> Text.unpack expectedChecksum <> "\n" <>
+        "Calculated checksum: " <> Text.unpack checksum <> "\n" <>
+        "Installation interrupted."
+
+-- === Utils === --
+
+generateChecksum :: forall hash m . (Crypto.HashAlgorithm hash, MonadIO m, MonadException SomeException m) => FilePath -> m ()
+generateChecksum file = do
+    sha <- Crypto.hashFile @m @hash $ encodeString file
+    shaFileNoExtension <- tryJust (shaUriError $ Shelly.toTextIgnore file) $ case currentHost of
+            Linux -> Text.stripSuffix "AppImage" $ Shelly.toTextIgnore file
+            _     -> Text.stripSuffix "tar.gz" $ Shelly.toTextIgnore file
+    let shaFilePath = shaFileNoExtension <> "sha256"
+    liftIO $ writeFile (convert shaFilePath) (show sha)
+
+-- checking just strings because converting to ByteString will prevent user to check it without manager and
+-- comparing Digests is nontrivial due to lack of read function working opposite to Show in Crypto.Hash library
+checkChecksum :: forall hash m . (Crypto.HashAlgorithm hash, MonadIO m, MonadThrow m, MonadException SomeException m) => FilePath -> FilePath -> m ()
+checkChecksum file shaFile = do
+    sha            <- Crypto.hashFile @m @hash $ encodeString file
+    shaSaved       <- liftIO $ readFile $ encodeString shaFile
+    let shaString = Text.pack $ show sha
+    unless (shaString == shaSaved) $ throwM $ toException $ SHAChecksumDoesNotMatchError file shaSaved shaString

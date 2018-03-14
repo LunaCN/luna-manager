@@ -4,6 +4,7 @@ import Prologue hiding (FilePath, fromText)
 
 import Luna.Manager.Command.Options (Options, guiInstallerOpt)
 import qualified Luna.Manager.Logger as Logger
+import Luna.Manager.Gui.DownloadProgress (Progress(..))
 import Luna.Manager.System.Env
 import Luna.Manager.Shell.ProgressBar
 import Luna.Manager.System.Path
@@ -32,6 +33,13 @@ import qualified Control.Exception.Safe as Exception
 data DownloadException = DownloadException Text SomeException deriving (Show)
 instance Exception DownloadException where
     displayException (DownloadException file exception) = "Couldn't download file: " <> convert file <> " because of: "  <> displayException exception
+
+data DownloadError = DownloadError { uriPath :: URIPath } deriving (Show)
+instance Exception DownloadError where
+    displayException (DownloadError p) = "Download Error: cannot read file: " <> show p
+
+downloadError :: URIPath -> SomeException
+downloadError = toException . DownloadError
 
 
 -- === Utils === --
@@ -73,8 +81,8 @@ downloadWithProgressBarTo address dstPath = Exception.handleAny (\e -> throwM (D
         let dstFile = dstPath </> (fromText name)
         res <- HTTP.http req manager
         -- Get the Content-Length and initialize the progress bar
-        let Just cl  = lookup hContentLength (HTTP.responseHeaders res)
-            pgTotal  = read (ByteStringChar.unpack cl)
+        cl <- tryJust (downloadError address) $ lookup hContentLength (HTTP.responseHeaders res)
+        let pgTotal  = read (ByteStringChar.unpack cl)
             pg       = ProgressBar 50 0 pgTotal
             progress = Progress 0 pgTotal
         -- Consume the response updating the progress bar

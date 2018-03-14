@@ -16,6 +16,7 @@ import           Luna.Manager.Gui.InstallationProgress
 import qualified Luna.Manager.Logger as Logger
 import           Luna.Manager.Network
 import           Luna.Manager.Shell.Commands
+import           Luna.Manager.Shell.ProgressBar
 import           Luna.Manager.System.Host
 import           Luna.Manager.Command.Options (Options)
 import qualified Luna.Manager.Command.Options as Opts
@@ -43,20 +44,20 @@ instance Exception ExtensionError where
 extensionError :: FilePath -> SomeException
 extensionError = toException . ExtensionError
 
-data ProgressException = ProgressException deriving (Show)
+data ProgressException = ProgressException String deriving (Show)
 instance Exception ProgressException where
-    displayException exception = "Can not return progress."
+    displayException (ProgressException err) = "Can not return progress. " <> err
 
 data UnpackingException = UnpackingException Text SomeException deriving (Show)
 instance Exception UnpackingException where
-    displayException (UnpackingException file exception ) = "Archive cannot be unpacked: " <> convert file <> " because of: " <> displayException exception
+    displayException (UnpackingException file exception) = "Archive cannot be unpacked: " <> convert file <> " because of: " <> displayException exception
 
 unpackingException :: Text -> SomeException -> SomeException
 unpackingException t e = toException $ UnpackingException t e
 
 unpack :: UnpackContext m => Double -> Text.Text -> FilePath -> m FilePath
 unpack totalProgress progressFieldName file = do
-    Logger.log $ "Unpacking archive: " <> plainTextPath file
+    Logger.info $ "Unpacking archive: " <> plainTextPath file
     ext          <- tryJust (extensionError file) $ extension file
     case currentHost of
         Windows -> case ext of
@@ -103,9 +104,18 @@ directProgressLogger progressFieldName totalProgress actualProgress = do
     let parsedActualProgress = Text.rational actualProgress
     case parsedActualProgress of
         Right x -> do
-            let progress =  (fst x) * totalProgress
+            let progress = fst x * totalProgress
             print $ "{\"" <> (convert progressFieldName) <> "\":\"" <> (show progress) <> "\"}"
-        Left err -> raise' ProgressException
+        Left err -> raise' $ ProgressException err
+
+progressBarLogger :: Text.Text -> IO ()
+progressBarLogger pg = do
+    let parsedProgress = Text.rational pg
+    case parsedProgress of
+        Right x -> do
+            let progress = ceiling $ fst x * (100 :: Double)
+            progressBar $ ProgressBar 50 progress 100
+        Left err -> raise' $ ProgressException err
 
 unpackTarGzUnix :: UnpackContext m => Double -> Text.Text -> FilePath -> m FilePath
 unpackTarGzUnix totalProgress progressFieldName file = do
@@ -149,22 +159,28 @@ unzipFileWindows zipFile = do
 untarWin :: UnpackContext m => Double -> Text.Text -> FilePath -> m FilePath
 untarWin totalProgress progressFieldName zipFile = do
     let scriptPath = "http://packages.luna-lang.org/windows/tar2.exe"
-
     guiInstaller <- Opts.guiInstallerOpt
     script       <- downloadFromURL scriptPath "Downloading archiving tool"
     let dir = directory zipFile
         name = dir </> basename zipFile
 
+    Shelly.mv script dir
+
     Shelly.chdir dir $ do
         Shelly.mkdir_p name
         if guiInstaller
-            then Shelly.log_stdout_with (directProgressLogger progressFieldName totalProgress) $ Shelly.cmd (dir </> filename script) "untar" (filename zipFile) name-- (\stdout -> liftIO $ hGetContents stdout >> print "33")
-            else Shelly.switchVerbosity $ Shelly.cmd (dir </> filename script) "untar" (filename zipFile) name `Exception.catchAny` (\err -> throwM (UnpackingException (Shelly.toTextIgnore zipFile) $ toException err))
+            then Shelly.log_stdout_with (directProgressLogger progressFieldName totalProgress) $ Shelly.cmd (dir </> filename script) "untar" (filename zipFile) name
+            else Shelly.log_stdout_with progressBarLogger $ Shelly.cmd (dir </> filename script) "untar" (filename zipFile) name `Exception.catchAny` (\err -> throwM (UnpackingException (Shelly.toTextIgnore zipFile) $ toException err))
         listed <- Shelly.ls $ dir </> name
         return $ if length listed == 1 then head listed else dir </> name
 
-zipFileWindows :: UnpackContext m => FilePath -> Text -> m FilePath
-zipFileWindows folder appName = do
+pack :: UnpackContext m => FilePath -> Text -> m FilePath
+pack = case currentHost of
+    Windows -> gzipWindows
+    _       -> gzipUnix
+
+gzipWindows :: UnpackContext m => FilePath -> Text -> m FilePath
+gzipWindows folder appName = do
     let name = parent folder </> Shelly.fromText (appName <> ".tar.gz")
     let scriptPath = "http://packages.luna-lang.org/windows/tar.exe"
     script <- downloadFromURL scriptPath "Downloading archiving tool"
@@ -178,8 +194,8 @@ unpackRPM file filepath = liftIO $ do
     (exitCode, out, err) <- Process.readProcess $ Process.setWorkingDir (encodeString filepath) $ Process.shell $ "rpm2cpio " <> encodeString file <> " | cpio -idmv"
     unless (exitCode == ExitSuccess) $ throwM (UnpackingException (Shelly.toTextIgnore file) (toException $ Exception.StringException (BSLChar.unpack err) callStack )) -- print $ "Fatal: rpm not unpacked. " <> err
 
-createTarGzUnix :: UnpackContext m => FilePath  -> Text -> m FilePath
-createTarGzUnix folder appName = do
+gzipUnix :: UnpackContext m => FilePath  -> Text -> m FilePath
+gzipUnix folder appName = do
     let name =  parent folder </> Shelly.fromText (appName <> ".tar.gz")
     Shelly.chdir (parent folder) $ Shelly.switchVerbosity $ do
         Shelly.cmd "tar" "-cpzf" name $ filename folder
