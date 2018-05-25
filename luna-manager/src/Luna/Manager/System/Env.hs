@@ -12,7 +12,8 @@ import           Filesystem.Path.CurrentOS
 import           Control.Monad.State.Layered
 import qualified System.Directory as System
 import           Control.Monad.Raise
-import           System.IO.Error
+import           System.IO.Error (isAlreadyExistsError)
+import           System.IO.Temp  (createTempDirectory)
 
 --------------------------
 -- === EnvConfig === --
@@ -82,9 +83,15 @@ copyDir src dst = do
 -- === Instances === --
 
 instance {-# OVERLAPPABLE #-} MonadIO m => MonadHostConfig EnvConfig sys arch m where
-    defaultHostConfig = EnvConfig <$> tmp where
-        tmp = (</> "luna") <$> decodeString <$> liftIO System.getTemporaryDirectory
+    defaultHostConfig = do
+        sysTmp  <- liftIO System.getTemporaryDirectory
+        lunaTmp <- liftIO $ createTempDirectory sysTmp "luna"
+        return $ EnvConfig $ decodeString lunaTmp
 
 instance {-# OVERLAPPABLE #-} MonadIO m => MonadHostConfig EnvConfig 'Windows arch m where
     -- | Too long paths are often problem on Windows, therefore we use C:\tmp to store temporary data
-    defaultHostConfig = return $ EnvConfig "C:\\tmp\\luna"
+    defaultHostConfig = do
+        let tmp = "C:\\tmp"
+        Shelly.shelly $ Shelly.mkdir_p tmp
+        lunaTmp <- liftIO $ createTempDirectory (encodeString tmp) "luna"
+        return $ EnvConfig $ decodeString lunaTmp

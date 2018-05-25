@@ -414,15 +414,6 @@ installApp' binPath package = do
     let appName = mkSystemPkgName pkgName <> ".app"
     touchApp (convert binPath </> convert appName) appType
 
-data VersionException = VersionException Text  deriving (Show)
-instance Exception VersionException where
-    displayException (VersionException v ) = "Unknown version: " <> show v
-
-readVersion :: (MonadIO m, MonadException SomeException m, MonadThrow m) => Text -> m Version
-readVersion v = case readPretty v of
-    Left e  -> throwM $ VersionException v
-    Right v -> return $ v
-
 -- Prompt user for the email, unless we already have it.
 askUserEmail :: MonadIO m => m Text
 askUserEmail = liftIO $ do
@@ -434,8 +425,12 @@ runApp :: MonadInstall m => Text -> Text -> AppType -> m ()
 runApp appName version appType = do
     installConfig <- get @InstallConfig
     installPath <- prepareInstallPath appType (installConfig ^. defaultBinPathGuiApp) appName version
-    let runPath = installPath </> (case currentHost of Linux -> ""; _ -> "bin" </> "main") </> fromText appName
-    threadID <- liftIO $ forkIO $ Process.runProcess_ $ Process.shell $ encodeString $ runPath
+    let runPath = case currentHost of
+            Linux   -> installPath </> fromText appName
+            Darwin  -> installPath </> "bin" </> "public" </> fromText appName </> fromText appName
+            Windows -> installPath </> "bin" </> "public" </> fromText appName </> fromText (appName <> ".exe")
+
+    threadID <- liftIO $ forkIO $ Shelly.shelly $ Shelly.cmd runPath
     Logger.log $ Text.pack $ show threadID
 
 askToRunApp :: MonadInstall m => Text -> Text -> AppType -> m ()
