@@ -4,16 +4,17 @@ module Luna.Manager.System.Env where
 
 import Prologue hiding (FilePath, fromText, toText)
 
-import           Luna.Manager.Command.Options
-import           Luna.Manager.System.Host
-import qualified Shelly.Lifted as Shelly
-import           Shelly.Lifted (MonadSh)
-import           Filesystem.Path.CurrentOS
-import           Control.Monad.State.Layered
-import qualified System.Directory as System
-import           Control.Monad.Raise
-import           System.IO.Error (isAlreadyExistsError)
-import           System.IO.Temp  (createTempDirectory)
+import qualified Control.Monad.State.Layered as State
+import qualified Shelly.Lifted               as Shelly
+import qualified System.Directory            as System
+
+import System.IO.Error (isAlreadyExistsError)
+import System.IO.Temp  (createTempDirectory)
+
+import Filesystem.Path.CurrentOS
+import Luna.Manager.System.Host
+
+
 
 --------------------------
 -- === EnvConfig === --
@@ -34,17 +35,11 @@ getHomePath = fromText . convert <$> liftIO System.getHomeDirectory
 getCurrentPath :: MonadIO m => m FilePath
 getCurrentPath = fromText . convert <$> liftIO System.getCurrentDirectory
 
-getTmpPath, getDownloadPath :: (MonadIO m, MonadGetters '[Options, EnvConfig] m, MonadSh m) => m FilePath
+getTmpPath, getDownloadPath :: (MonadIO m, State.Getter EnvConfig m) => m FilePath
+getTmpPath      = State.gets @EnvConfig (view localTempPath)
 getDownloadPath = getTmpPath
-getTmpPath      = do
-    userTmpPath <- gets @Options   (globals.selectedTmpPath)
-    cfgTmpPath  <- gets @EnvConfig localTempPath
-    let tmp = fromMaybe cfgTmpPath $ fromText <$> userTmpPath
-    Shelly.mkdir_p tmp
-    return tmp
 
-
-setTmpCwd :: (MonadGetters '[Options, EnvConfig] m, MonadIO m, MonadSh m) => m ()
+setTmpCwd :: (State.Getter EnvConfig m, MonadIO m) => m ()
 setTmpCwd = liftIO . System.setCurrentDirectory . encodeString =<< getTmpPath
 
 createSymLink ::  MonadIO m => FilePath -> FilePath -> m ()
@@ -56,8 +51,8 @@ createSymLink src dst = liftIO $  (System.createFileLink (encodeString src) (enc
             Just ioExc -> if isAlreadyExistsError ioExc then do
                     System.removeFile $ encodeString dst
                     createSymLink src dst
-                else return ()
-            Nothing -> return ()
+                else pure ()
+            Nothing -> pure ()
 
 createSymLinkDirectory ::  MonadIO m => FilePath -> FilePath -> m ()
 createSymLinkDirectory src dst = liftIO $ (System.createDirectoryLink (encodeString src) (encodeString dst)) `catch` handler src dst where
@@ -67,8 +62,8 @@ createSymLinkDirectory src dst = liftIO $ (System.createDirectoryLink (encodeStr
             Just ioExc -> if isAlreadyExistsError ioExc then do
                     System.removeDirectoryLink $ encodeString dst
                     createSymLinkDirectory src dst
-                else return ()
-            Nothing -> return ()
+                else pure ()
+            Nothing -> pure ()
 
 
 copyDir :: Shelly.MonadSh m => FilePath -> FilePath -> m ()-- copy the content of the source directory
@@ -83,15 +78,7 @@ copyDir src dst = do
 -- === Instances === --
 
 instance {-# OVERLAPPABLE #-} MonadIO m => MonadHostConfig EnvConfig sys arch m where
-    defaultHostConfig = do
-        sysTmp  <- liftIO System.getTemporaryDirectory
-        lunaTmp <- liftIO $ createTempDirectory sysTmp "luna"
-        return $ EnvConfig $ decodeString lunaTmp
-
-instance {-# OVERLAPPABLE #-} MonadIO m => MonadHostConfig EnvConfig 'Windows arch m where
-    -- | Too long paths are often problem on Windows, therefore we use C:\tmp to store temporary data
-    defaultHostConfig = do
-        let tmp = "C:\\tmp"
-        Shelly.shelly $ Shelly.mkdir_p tmp
-        lunaTmp <- liftIO $ createTempDirectory (encodeString tmp) "luna"
-        return $ EnvConfig $ decodeString lunaTmp
+    defaultHostConfig = liftIO $ do
+        sysTmp  <- System.getTemporaryDirectory
+        lunaTmp <- createTempDirectory sysTmp "luna"
+        pure $ EnvConfig $ decodeString lunaTmp

@@ -1,32 +1,29 @@
 module Luna.Manager.Network where
 
-import Prologue hiding (FilePath, fromText)
+import Prologue hiding (FilePath, fromText, fromJust)
 
-import Luna.Manager.Command.Options (Options, guiInstallerOpt)
-import qualified Luna.Manager.Logger as Logger
-import Luna.Manager.Gui.DownloadProgress (Progress(..))
-import Luna.Manager.System.Env
-import Luna.Manager.Shell.ProgressBar
-import Luna.Manager.System.Path
-import Luna.Manager.Shell.Shelly (MonadSh, MonadShControl)
+import qualified Control.Exception.Safe      as Exception
+import qualified Control.Monad.State.Layered as State
+import qualified Data.ByteString.Char8       as ByteStringChar (unpack)
+import qualified Data.ByteString.Lazy.Char8  as ByteStringL
+import qualified Luna.Manager.Logger         as Logger
+import qualified Network.HTTP.Conduit        as HTTP
+import qualified Network.URI                 as URI
 
-import Control.Monad.Raise
-import Control.Monad.State.Layered
+import Control.Monad.Exception           (MonadException, fromJust)
+import Control.Monad.Trans.Resource      (runResourceT)
+import Data.Conduit                      (runConduit, (.|))
+import Data.Conduit.Binary               (sinkFile)
 import Filesystem.Path.CurrentOS
-import qualified Network.HTTP.Conduit       as HTTP
-import           Network.HTTP.Conduit       (httpLbs)
-import qualified Network.URI                as URI
-import qualified Data.ByteString.Lazy.Char8 as ByteStringL
-
-import Control.Monad.Trans.Resource ( MonadBaseControl, runResourceT)
-
-import Data.Conduit (($$+-),($=+))
-import Data.Conduit.List (sinkNull)
-import Data.Conduit.Binary (sinkFile)
-import Network.HTTP.Types (hContentLength)
-import qualified Data.ByteString.Char8 as ByteStringChar (unpack, writeFile)
-import qualified Data.Text as Text
-import qualified Control.Exception.Safe as Exception
+import Luna.Manager.Command.Options      (Options, guiInstallerOpt)
+import Luna.Manager.Gui.DownloadProgress (Progress (..))
+import Luna.Manager.Shell.ProgressBar
+import Luna.Manager.Shell.Shelly         (MonadSh, MonadShControl)
+import Luna.Manager.System.Env
+import Luna.Manager.System.Path
+import Network.HTTP.Conduit              (httpLbs)
+import Network.HTTP.Types                (hContentLength)
+import System.Directory                  (doesFileExist)
 
 -- === Errors === --
 
@@ -46,21 +43,25 @@ downloadError = toException . DownloadError
 
 takeFileNameFromURL :: URIPath -> Maybe Text
 takeFileNameFromURL url = convert <$> name where
-    name = maybeLast . URI.pathSegments =<< URI.parseURI (convert url)
+    name = last . URI.pathSegments =<< URI.parseURI (convert url)
 
-type MonadNetwork m = (MonadIO m, MonadGetters '[Options, EnvConfig] m, MonadException SomeException m, MonadSh m, MonadShControl m, MonadCatch m, MonadThrow m,  MonadBaseControl IO m)
+type MonadNetwork m = (MonadIO m, State.Getters '[Options, EnvConfig] m, MonadException SomeException m, MonadSh m, MonadShControl m, MonadCatch m, MonadThrow m)
+
+fileExists :: MonadIO m => FilePath -> m Bool
+fileExists = liftIO . doesFileExist . encodeString
 
 downloadFromURL :: MonadNetwork m => URIPath -> Text -> m FilePath
 downloadFromURL address info = do
     let go = withJust (takeFileNameFromURL address) $ \name -> do
             Logger.log $ info <>" (" <> address <> ")"
             dest    <- (</> (fromText name)) <$> getDownloadPath
-            manager <- newHTTPManager
-            request <- HTTP.parseUrlThrow (convert address)
-            resp    <- httpLbs request manager
-            liftIO $ ByteStringL.writeFile (encodeString dest) $ HTTP.responseBody resp
-            return dest
-    go `Exception.catchAny` \e -> throwM (DownloadException address e)  where
+            unlessM (fileExists dest) $ do
+                manager <- newHTTPManager
+                request <- HTTP.parseUrlThrow (convert address)
+                resp    <- httpLbs request manager
+                liftIO $ ByteStringL.writeFile (encodeString dest) $ HTTP.responseBody resp
+            pure dest
+    go `Exception.catchAny` \e -> throwM (DownloadException address e)
 
 newHTTPManager :: MonadIO m => m HTTP.Manager
 newHTTPManager = liftIO . HTTP.newManager $ HTTP.tlsManagerSettings { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro 30000000}
@@ -76,19 +77,23 @@ downloadWithProgressBarTo address dstPath = Exception.handleAny (\e -> throwM (D
     guiInstaller <- guiInstallerOpt
     req          <- HTTP.parseRequest (convert address)
     manager      <- newHTTPManager
-    -- Start the request
-    runResourceT $ withJust (takeFileNameFromURL address) $ \name -> do
-        let dstFile = dstPath </> (fromText name)
+    
+    name <- fromJust (downloadError address) (takeFileNameFromURL address)
+    let dstFile = dstPath </> (fromText name)
+    liftIO $ runResourceT $ do
+        -- Start the request
         res <- HTTP.http req manager
         -- Get the Content-Length and initialize the progress bar
-        cl <- tryJust (downloadError address) $ lookup hContentLength (HTTP.responseHeaders res)
-        let pgTotal  = read (ByteStringChar.unpack cl)
+        cl <- fromJust (downloadError address) $ lookup hContentLength (HTTP.responseHeaders res)
+        let pgTotal  = unsafeRead (ByteStringChar.unpack cl) -- FIXME
             pg       = ProgressBar 50 0 pgTotal
             progress = Progress 0 pgTotal
+
         -- Consume the response updating the progress bar
-        if guiInstaller then
-            HTTP.responseBody res $=+ updateProgress progress $$+- sinkFile (encodeString dstFile)
-        else do
-            HTTP.responseBody res $=+ updateProgressBar pg    $$+- sinkFile (encodeString dstFile)
-            putStrLn "Download completed!"
-        return dstFile
+        runConduit $ do
+            if guiInstaller then
+                HTTP.responseBody res .| updateProgress progress .| sinkFile (encodeString dstFile)
+            else do
+                HTTP.responseBody res .| updateProgressBar pg    .| sinkFile (encodeString dstFile)
+                putStrLn "Download completed!"
+    pure dstFile

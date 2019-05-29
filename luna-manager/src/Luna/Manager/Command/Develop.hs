@@ -2,30 +2,25 @@
 {-# LANGUAGE OverloadedStrings    #-}
 module Luna.Manager.Command.Develop where
 
-import Prologue hiding (FilePath)
-import Luna.Manager.Command.Options
-import Luna.Manager.Network
-import Luna.Manager.System.Env
-import Control.Monad.Raise
-import Control.Monad.State.Layered
-import Data.Text                   (Text)
-import Luna.Manager.Shell.Shelly   (MonadSh, MonadShControl)
-import Filesystem.Path.CurrentOS   (FilePath, (</>), encodeString, decodeString, toText, basename, hasExtension, parent)
-import qualified System.Directory as System
-import qualified Luna.Manager.Shell.Shelly as Shelly
-import qualified Luna.Manager.Archive      as Archive
+import Prologue hiding (FilePath, fromJust)
 
-import Luna.Manager.Component.Repository
+import qualified Control.Monad.State.Layered as State
+import qualified Luna.Manager.Archive        as Archive
+import qualified Luna.Manager.Shell.Shelly   as Shelly
+import qualified System.Directory            as System
+
+import Control.Monad.Exception              (MonadException, fromJust)
+import Data.Text                            (Text)
+import Filesystem.Path.CurrentOS            (FilePath, parent, (</>))
 import Luna.Manager.Command.CreatePackage
-import Luna.Manager.Component.Version
+import Luna.Manager.Command.Options
+import Luna.Manager.Component.PackageConfig
+import Luna.Manager.Component.Repository
+import Luna.Manager.Network
+import Luna.Manager.Shell.Shelly            (MonadSh, MonadShControl)
+import Luna.Manager.System.Env
 import Luna.Manager.System.Host
-import Luna.Manager.System.Path (expand)
-import Control.Monad.Trans.Resource ( MonadBaseControl)
-
-import qualified Data.Text as T
-default (T.Text)
-
-
+import Luna.Manager.System.Path             (expand)
 
 data DevelopConfig = DevelopConfig { _stackPath      :: Text
                                    , _devPath        :: FilePath
@@ -36,12 +31,12 @@ data DevelopConfig = DevelopConfig { _stackPath      :: Text
                                     }
 makeLenses ''DevelopConfig
 
-type MonadDevelop m = (MonadGetter Options m, MonadStates '[EnvConfig, RepoConfig, PackageConfig, DevelopConfig] m, MonadIO m, MonadException SomeException m, MonadSh m, MonadShControl m, MonadCatch m, MonadBaseControl IO m)
+type MonadDevelop m = (State.Getter Options m, State.MonadStates '[EnvConfig, RepoConfig, PackageConfig, DevelopConfig] m, MonadIO m, MonadException SomeException m, MonadSh m, MonadShControl m, MonadCatch m)
 
 
 instance Monad m => MonadHostConfig DevelopConfig 'Linux arch m where
-    defaultHostConfig = return $ DevelopConfig
-        { _stackPath      = "https://github.com/commercialhaskell/stack/releases/download/v1.6.3/stack-1.6.3-linux-x86_64-static.tar.gz"
+    defaultHostConfig = pure $ DevelopConfig
+        { _stackPath      = "https://github.com/commercialhaskell/stack/releases/download/v1.9.1/stack-1.9.1-linux-x86_64-static.tar.gz"
         , _devPath        = "luna-develop"
         , _appsPath       = "apps"
         , _toolsPath      = "tools"
@@ -51,7 +46,7 @@ instance Monad m => MonadHostConfig DevelopConfig 'Linux arch m where
 
 instance Monad m => MonadHostConfig DevelopConfig 'Darwin arch m where
     defaultHostConfig = reconfig <$> defaultHostConfigFor @Linux where
-        reconfig cfg = cfg & stackPath .~ "https://github.com/commercialhaskell/stack/releases/download/v1.6.3/stack-1.6.3-osx-x86_64.tar.gz"
+        reconfig cfg = cfg & stackPath .~ "https://github.com/commercialhaskell/stack/releases/download/v1.9.1/stack-1.9.1-osx-x86_64.tar.gz"
 
 instance Monad m => MonadHostConfig DevelopConfig 'Windows arch m where
     defaultHostConfig = defaultHostConfigFor @Linux
@@ -66,19 +61,19 @@ downloadAndUnpackStack path = do
     if stackPresent
         then liftIO $ putStrLn "Stack is already installed, skipping"
         else do
-            developConfig <- get @DevelopConfig
+            developConfig <- State.get @DevelopConfig
             let stackURL           = developConfig ^. stackPath
                 totalProgress      = 1.0
                 progressFielsdName = ""
             putStrLn "Downloading stack"
             stackArch <- downloadWithProgressBar stackURL
-            stackArch' <- Archive.unpack totalProgress progressFielsdName stackArch
+            stackArch' <- Archive.unpack totalProgress progressFielsdName stackArch Nothing
             Shelly.whenM (Shelly.test_d path) $ Shelly.rm_rf path
             Shelly.mv stackArch' path
 
 getLatestRepo :: MonadDevelop m => Text -> FilePath -> m Text
 getLatestRepo appName appPath = do
-    let repoPath = "git@github.com:luna/" <> appName <> ".git"
+    let repoPath = "https://github.com/luna/" <> appName <> ".git"
     repoExists <- Shelly.test_d appPath
     if repoExists
         then Shelly.chdir appPath $ Shelly.cmd "git" "pull" "origin" "master"
@@ -94,30 +89,27 @@ downloadDeps appName appPath = do
 
 run :: MonadDevelop m => DevelopOpts -> m ()
 run opts = do
-    developCfg <- get @DevelopConfig
+    developCfg <- State.get @DevelopConfig
     let appName  = opts ^. target
     if (opts ^. downloadDependencies) then do
-        path <- tryJust (toException PathException) (opts ^. repositoryPath)
+        path <- fromJust (toException PathException) (opts ^. repositoryPath)
         downloadDeps appName $ convert path
     else do
-        let path = opts ^. repositoryPath
-        workingPath <- case path of
-            Just workingPath -> return workingPath
-            Nothing -> do
-                home <- liftIO $ System.getHomeDirectory
-                return $ convert home
-        appPath         <- expand $ convert workingPath </> (developCfg ^. devPath) </> (developCfg ^. appsPath) </> convert appName
-        stackFolderPath <- expand  $ convert workingPath </> (developCfg ^. devPath) </> (developCfg ^. toolsPath) </> (developCfg ^. stackLocalPath)
+        workingPath <- case opts ^. repositoryPath of
+            Just wp -> pure wp
+            Nothing -> convert <$> liftIO System.getHomeDirectory
+        putStrLn $ "workingPath: " <> show workingPath
+        let basePath = convert workingPath </> (developCfg ^. devPath)
+        putStrLn $ "basePath: " <> show basePath
+        appPath         <- expand $ basePath </> (developCfg ^. appsPath) </> convert appName
+        putStrLn $ "appPath: " <> show appPath
+        stackFolderPath <- expand $ basePath </> (developCfg ^. toolsPath) </> (developCfg ^. stackLocalPath)
         Shelly.mkdir_p $ parent stackFolderPath
         downloadAndUnpackStack stackFolderPath
         getLatestRepo appName appPath
         Shelly.prependToPath stackFolderPath
-        Shelly.setenv "APP_PATH" $ Shelly.toTextIgnore appPath
+        Shelly.setenv "APP_PATH" $ Shelly.toTextIgnore basePath
         let bootstrapPath      = Shelly.toTextIgnore $ appPath </> (developCfg ^. bootstrapFile)
-            bootstrapPackages  = ["base", "exceptions", "shelly", "text", "directory", "system-filepath"]
-            bootstrapStackArgs = ["--resolver", "lts-8.2", "--install-ghc" , "runghc"]
-                                 <> (bootstrapPackages >>= (\p -> ["--package", p]))
-                                 <> [bootstrapPath]
-        Shelly.run "stack" bootstrapStackArgs
+        Shelly.run "stack" [bootstrapPath]
         downloadDeps appName appPath
 

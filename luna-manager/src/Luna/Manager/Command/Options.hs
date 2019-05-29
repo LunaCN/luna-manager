@@ -2,11 +2,11 @@ module Luna.Manager.Command.Options where
 
 import Prologue
 
-import Data.Text (Text)
+import Data.Text           (Text)
 import Options.Applicative as Opts
-import Control.Monad.State.Layered
 
-import qualified Luna.Manager.System.Info as Info
+import qualified Control.Monad.State.Layered as State
+import qualified Luna.Manager.System.Info    as Info
 
 
 ------------------------------
@@ -49,11 +49,11 @@ data InstallOpts = InstallOpts
     } deriving (Show)
 
 data MakePackageOpts = MakePackageOpts
-    { _cfgPath       :: Text
-    , _pkgVersion    :: Text
-    , _guiURL        :: Maybe Text
-    , _permitNoTags  :: Bool
-    , _buildFromHead :: Bool
+    { _cfgPath    :: Text
+    , _pkgVersion :: Text
+    , _guiURL     :: Maybe Text
+    , _extPkgUrls :: [Text]
+    , _dryRun     :: Bool
     } deriving (Show)
 
 data SwitchVersionOpts = SwitchVersionOpts
@@ -89,9 +89,9 @@ makeLenses ''NextVersionOpts
 makeLenses ''PromoteOpts
 
 -- small helpers for Options
-verboseOpt, guiInstallerOpt :: MonadGetter Options m => m Bool
-verboseOpt      = view (globals . verbose)      <$> get @Options
-guiInstallerOpt = view (globals . guiInstaller) <$> get @Options
+verboseOpt, guiInstallerOpt :: State.Getter Options m => m Bool
+verboseOpt      = view (globals . verbose)      <$> State.get @Options
+guiInstallerOpt = view (globals . guiInstaller) <$> State.get @Options
 
 -- === Instances === --
 
@@ -104,8 +104,8 @@ instance Default InstallOpts where def = InstallOpts def def def def def False F
 
 -- === Parsers === --
 
-evalOptionsParserT :: MonadIO m => StateT Options m a -> m a
-evalOptionsParserT m = evalStateT m =<< parseOptions
+evalOptionsParserT :: MonadIO m => State.StateT Options m a -> m a
+evalOptionsParserT m = State.evalT m =<< parseOptions
 
 parseOptions :: MonadIO m => m Options
 parseOptions = liftIO $ customExecParser (prefs showHelpOnEmpty) optsParser where
@@ -131,12 +131,12 @@ parseOptions = liftIO $ customExecParser (prefs showHelpOnEmpty) optsParser wher
     optsMkpkg'         = MakePackageOpts   <$> strArgument (metavar "CONFIG"  <> help "Config (luna-package.yaml) file path, usually found in the Luna Studio repo")
                                            <*> strArgument (metavar "VERSION" <> help "Package version")
                                            <*> (optional . strOption $ long "gui" <> metavar "GUI_URL" <> help "Path to gui package on S3")
-                                           <*> Opts.switch (long "permit-no-tags"  <> help "Do not throw an error if there is no tag for this version. Use with care.")
-                                           <*> Opts.switch (long "build-from-head" <> help "Build bypassing the tag-based flow, using HEAD. Use with care.")
+                                           <*> (many . strOption $ long "external-package" <> metavar "PKG_URL" <> help "URL of an additional external package to include (e.g. Dataframes)")
+                                           <*> Opts.switch (long "dry-run"         <> help "Make a dry-run package build, not rebuilding Luna Studio or downloading dependencies (useful for development).")
     optsSwitchVersion  = SwitchVersion     <$> optsSwitchVersion'
     optsSwitchVersion' = SwitchVersionOpts <$> strArgument (metavar "VERSION" <> help "Target version to switch to")
     optsDevelop        = Develop           <$> optsDevelop'
-    optsDevelop'       = DevelopOpts       <$> (strArgument $ metavar "CONFIG" <> help "Config (luna-package.yaml) file path, usually found in the Luna Studio repo")
+    optsDevelop'       = DevelopOpts       <$> (strArgument $ metavar "APPLICATION" <> help "Name of the application to install. Example: luna-studio")
                                            <*> (optional . strOption $ long "path" <> metavar "PATH" <> help "Path under which the new repository will be created and set up.")
                                            <*> Opts.switch (long "download-dependencies" <> help "Instead of setting up the fresh repo, just download the external dependencies into the existing repo.")
     optsInstall        = Install           <$> optsInstall'

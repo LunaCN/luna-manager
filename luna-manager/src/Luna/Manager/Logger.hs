@@ -1,30 +1,24 @@
-{-# LANGUAGE OverloadedStrings    #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Luna.Manager.Logger where
 
-import           Prologue                     hiding (FilePath, log)
-import           Control.Monad.Raise
-import           Control.Monad.State.Layered
-import           Data.Text                    (Text, pack, unpack)
-import qualified Data.Text.IO                 as Text
-import           Filesystem.Path.CurrentOS    (FilePath, (</>), decodeString)
-import           Shelly.Lifted                (MonadSh, MonadShControl)
-import qualified Shelly.Lifted                as Sh
-import           System.Directory             (getAppUserDataDirectory)
-import           System.IO                    (hFlush, stdout)
-import qualified System.Directory             as SystemDirectory
+import qualified Control.Monad.State.Layered as State
+import qualified Data.Text.IO                as Text
+import qualified Shelly.Lifted               as Sh
 import qualified System.Process.Typed        as Process
 
-import           Data.Aeson           (FromJSON, ToJSON, FromJSONKey, ToJSONKey, parseJSON, encode)
-import qualified Data.Aeson           as JSON
-import qualified Data.Aeson.Types     as JSON
-import qualified Data.Aeson.Encoding  as JSON
-import qualified Data.ByteString.Lazy as BS
-import           Control.Lens.Aeson
+import Control.Monad.Exception      (MonadException, throw)
+import Data.Aeson                   (FromJSON, ToJSON, encode)
+import Data.Text                    (Text, pack, unpack)
+import Filesystem.Path.CurrentOS    (FilePath, decodeString, (</>))
+import Luna.Manager.Command.Options (Options, globals, guiInstaller, verbose)
+import Luna.Manager.System.Env      (EnvConfig)
+import Prologue                     hiding (FilePath, log)
+import Shelly.Lifted                (MonadSh, MonadShControl)
+import System.Directory             (getAppUserDataDirectory)
+import System.IO                    (hFlush, stdout)
 
-import           Luna.Manager.Command.Options
-import           Luna.Manager.System.Env      (EnvConfig)
-import qualified Luna.Manager.System.Env      as System
+
 
 
 data WarningMessage = WarningMessage { message :: Text
@@ -33,14 +27,14 @@ data WarningMessage = WarningMessage { message :: Text
 instance ToJSON   WarningMessage
 instance FromJSON WarningMessage
 
-type LoggerMonad m = (MonadIO m, MonadSh m, MonadShControl m, MonadGetters '[Options, EnvConfig] m)
+type LoggerMonad m = (MonadIO m, MonadSh m, MonadShControl m, State.Getters '[Options, EnvConfig] m)
 
 
 logFilePath :: LoggerMonad m => m FilePath
 logFilePath = do
     tmpDir <- decodeString <$> (liftIO $ getAppUserDataDirectory "luna_manager")
     Sh.mkdir_p tmpDir
-    return $ tmpDir </> "luna-manager.log"
+    pure $ tmpDir </> "luna-manager.log"
 
 logToStdout :: Text -> IO ()
 logToStdout msg = do
@@ -57,7 +51,7 @@ logToTmpFile msg = do
 
 info :: LoggerMonad m => Text -> m ()
 info msg = do
-    opts <- view globals <$> get @Options
+    opts <- view globals <$> State.get @Options
     let gui  = opts ^. guiInstaller
         msg' = msg <> "\n"
     if gui then logToTmpFile msg' else liftIO $ logToStdout msg'
@@ -65,7 +59,7 @@ info msg = do
 log :: LoggerMonad m => Text -> m ()
 log msg = do
     -- TODO[piotrMocz] we need a more robust logging solution in the long run
-    opts <- view globals <$> get @Options
+    opts <- view globals <$> State.get @Options
     let verb = opts ^. verbose
         gui  = opts ^. guiInstaller
         msg' = msg <> "\n"
@@ -74,7 +68,8 @@ log msg = do
 logProcess :: LoggerMonad m => Text -> m ()
 logProcess cmd = do
     logToTmpFile $ cmd <> "\n"
-    (exit, out, err) <- Process.readProcess $ Process.shell $ unpack cmd
+    let proc = Process.readProcess . Process.shell
+    (exit, out, err) <- proc $ unpack cmd
     logToTmpFile $ "output: " <> pack (show out) <> "\n"
     logToTmpFile $ "error: "  <> pack (show err) <> "\n"
 
@@ -83,7 +78,7 @@ logToJSON = liftIO . print . encode . WarningMessage
 
 warning :: LoggerMonad m => Text -> m ()
 warning msg = do
-    opts <- view globals <$> get @Options
+    opts <- view globals <$> State.get @Options
     let verb = opts ^. verbose
         gui  = opts ^. guiInstaller
         m    = "WARNING: " <> msg
@@ -99,5 +94,5 @@ logObject :: (LoggerMonad m, Show a) => Text -> a -> m ()
 logObject name obj = log $ name <> ": " <> (pack $ show obj)
 
 tryJustWithLog :: (LoggerMonad m, Show e, MonadException e m) => Text -> e -> Maybe a -> m a
-tryJustWithLog funName e (Just x) = return x
-tryJustWithLog funName e Nothing  = exception funName e >> raise e
+tryJustWithLog funName e (Just x) = pure x
+tryJustWithLog funName e Nothing  = exception funName e >> throw e
